@@ -28,6 +28,7 @@
 #include <maya/MItMeshVertex.h>
 #include <maya/MItMeshFaceVertex.h>
 #include <maya/MItMeshPolygon.h>
+#include <maya/MMatrixArray.h>
 
 #include <maya/MMeshIntersector.h>
 
@@ -71,6 +72,9 @@ MStatus GeoOperatorNode::initialize()
         eAttr.addField( "Gaussian" , 1);
         eAttr.addField( "MaxPrinciple", 2 );
         eAttr.addField( "MinPrinciple", 3 );
+        eAttr.addField( "PricipleRatio", 4 );
+        eAttr.addField( "ErrorQuadratic", 5 );
+        eAttr.addField( "Hybrid", 6 );
         addAttribute( ia_type );
     }
     
@@ -110,8 +114,32 @@ void GeoOperatorNode::draw(M3dView &view, const MDagPath &path, M3dView::Display
 
 void GeoOperatorNode::set_color( MDataHandle &outputHnd )
 {
-    std::vector< double > means;
-    vertex_curvatures( outputHnd, means );
+    std::vector< double > values;
+    
+    MObject meshData = outputHnd.asMesh();
+    if( m_type == kErrorQuadratic )
+    {
+        error_qudratic( meshData, values );
+    }
+    else if( m_type == kHybrid )
+    {
+        std::vector< double > errors, means;
+        error_qudratic( meshData, errors );
+        vertex_curvatures( outputHnd,  means, kMean );
+        
+        values.resize( errors.size() );
+        for( int i = 0; i < errors.size(); i++ )
+        {
+            values[ i ] = errors[ i ] + means[ i ];
+        }
+        
+        normalize( values );
+    }
+    else
+    {
+        vertex_curvatures( outputHnd, values, m_type );
+    }
+    
     MStatus stat;
     MFnMesh meshFn( outputHnd.asMesh(), &stat );
     
@@ -121,30 +149,34 @@ void GeoOperatorNode::set_color( MDataHandle &outputHnd )
     MPointArray pts;
     meshFn.getPoints( pts );
     
-    MColorArray curvature_colors;
-    encode_color( means,  curvature_colors );
-    
-    MIntArray poly_vertId;
-    for( size_t f = 0; f < meshFn.numPolygons(); f++ )
+    if( values.size() == pts.length() )
     {
-        MIntArray vertexList;
-        meshFn.getPolygonVertices( f, vertexList );
-        for( size_t v = 0; v < vertexList.length(); v++ )
+        MColorArray curvature_colors;
+        encode_color( values,  curvature_colors );
+        
+        MIntArray poly_vertId;
+        for( size_t f = 0; f < meshFn.numPolygons(); f++ )
         {
-            poly_vertId.append( vertex_colors.length() );
-            vertex_colors.append( curvature_colors[ vertexList[ v ] ] );
+            MIntArray vertexList;
+            meshFn.getPolygonVertices( f, vertexList );
+            for( size_t v = 0; v < vertexList.length(); v++ )
+            {
+                poly_vertId.append( vertex_colors.length() );
+                vertex_colors.append( curvature_colors[ vertexList[ v ] ] );
+            }
         }
+        
+        stat = meshFn.setColors( vertex_colors, &color_set );
+        stat = meshFn.assignColors( poly_vertId, &color_set );
     }
-    
-    stat = meshFn.setColors( vertex_colors, &color_set );
-    stat = meshFn.assignColors( poly_vertId, &color_set );
 }
 
-void GeoOperatorNode::vertex_curvatures( MDataHandle &outputHnd, std::vector< double > &curvatures )
+void GeoOperatorNode::vertex_curvatures( MDataHandle &outputHnd, std::vector< double > &curvatures, short curvature_type  )
 {
     MObject meshData = outputHnd.asMesh();
     MItMeshVertex vertIter( meshData );
     MItMeshPolygon polyIter( meshData );
+    MItMeshEdge edgeIter( meshData );
     
     MFnMesh meshFn( meshData );
     MPointArray pts;
@@ -161,37 +193,76 @@ void GeoOperatorNode::vertex_curvatures( MDataHandle &outputHnd, std::vector< do
         const double Kg = gaussian_curvature( meshData,  vertIter );
         const double deltaX = Kh*Kh - Kg;
         
-        if( m_type == kMean )
+        if( curvature_type == kMean )
         {
-            curvatures[ id++ ] = Kh;
+            curvatures[ id ] = Kh;
         }
-        else if( m_type == kGaussian )
+        else if( curvature_type == kGaussian )
         {
-            curvatures[ id++ ] = Kg;
+            curvatures[ id ] = Kg;
         }
-        else if( m_type == kMaxPrinciple )
+        else if( curvature_type == kMaxPrinciple )
         {
-            curvatures[ id++ ] = Kh + sqrt( deltaX );
+            curvatures[ id ] = Kh + sqrt( deltaX );
         }
-        else if( m_type == kMinPrinciple )
+        else if( curvature_type == kMinPrinciple )
         {
-            curvatures[ id++ ] = Kh - sqrt( deltaX );
+            curvatures[ id ] = Kh - sqrt( deltaX );
         }
+        else if( curvature_type == kPricipleRatio )
+        {
+            double Cmin = Kh - sqrt( deltaX ), Cmax = Kh + sqrt( deltaX );
+            curvatures[ id ] = ( Cmin != 0.0 ? Cmax/Cmin : 0.0 ) ;
+        }
+        
+        // check if on the boundary
+        bool on_boundary = false;
+        
+        MIntArray edgeList;
+        vertIter.getConnectedEdges( edgeList );
+        
+        int preEdge;
+        for( size_t e = 0; e < edgeList.length(); e++ )
+        {
+            edgeIter.setIndex( edgeList[ e ], preEdge );
+            on_boundary = edgeIter.onBoundary();
+        }
+        
+        if( on_boundary )
+        {
+            curvatures[ id ] = 0.0;
+        }
+        else if( 0 )
+        {
+            cout<<"--------------------------- "<<endl;
+            cout<<" Mean Curvature: "<<Kh<<endl;
+            cout<<" Gaussian Curvature: "<<Kg<<endl;
+            cout<<" Max Principle: "<<Kh + sqrt( deltaX )<<endl;
+            cout<<" Min Principle: "<<Kh - sqrt( deltaX )<<endl;
+        }
+        
+        id++;
     }
+    
+    normalize( curvatures );
+}
+
+void GeoOperatorNode::normalize( std::vector< double > &values )
+{
     
     double max_c = 0.0, min_c = 1.e+12;
     
-    for( size_t i = 0; i < curvatures.size(); i++ )
+    for( size_t i = 0; i < values.size(); i++ )
     {
-        max_c = ( curvatures[ i ] > max_c ? curvatures[ i ] : max_c );
-        min_c = ( curvatures[ i ] < min_c ? curvatures[ i ] : min_c );
+        max_c = ( values[ i ] > max_c ? values[ i ] : max_c );
+        min_c = ( values[ i ] < min_c ? values[ i ] : min_c );
     }
-    
+
     if( max_c > min_c )
     {
-        for( size_t i = 0; i < curvatures.size(); i++ )
+        for( size_t i = 0; i < values.size(); i++ )
         {
-            curvatures[ i ] = ( curvatures[ i ] - min_c ) / ( max_c - min_c );
+            values[ i ] = ( values[ i ] - min_c ) / ( max_c - min_c );
         }
     }
 }
@@ -412,6 +483,122 @@ void GeoOperatorNode::encode_color( const std::vector< double >& means, MColorAr
     }
 }
 
+void GeoOperatorNode::error_qudratic( MObject &mesh, std::vector<double> &errors )
+{
+    MFnMesh meshFn( mesh );
+    
+    const int num_faces = meshFn.numPolygons();
+    std::vector< Plane > face_planes( num_faces );
+    
+    MPointArray pts;
+    meshFn.getPoints( pts );
+    
+    for( int i = 0; i < num_faces; i++ )
+    {
+        MMatrix A, B, C, D;
+        A.setToIdentity(); B.setToIdentity(); C.setToIdentity(); D.setToIdentity();
+        
+        MIntArray vertList;
+        meshFn.getPolygonVertices( i, vertList );
+        
+        assert( vertList.length() == 3 );
+        
+        MPoint p1( pts[ vertList[ 0 ]]), p2( pts[ vertList[ 1 ] ]), p3( pts[ vertList[ 2 ] ] );
+        D[0][0] = p1.x; D[0][1] = p1.y; D[0][2] = p1.z;
+        D[1][0] = p2.x; D[1][1] = p2.y; D[1][2] = p2.z;
+        D[2][0] = p3.x; D[2][1] = p3.y; D[2][2] = p3.z;
+        
+        A[0][0] = 1.; A[0][1] = p1.y; A[0][2] = p1.z;
+        A[1][0] = 1.; A[1][1] = p2.y; A[1][2] = p2.z;
+        A[2][0] = 1.; A[2][1] = p3.y; A[2][2] = p3.z;
+        
+        B[0][0] = p1.x; B[0][1] = 1.; B[0][2] = p1.z;
+        B[1][0] = p2.x; B[1][1] = 1.; B[1][2] = p2.z;
+        B[2][0] = p3.x; B[2][1] = 1.; B[2][2] = p3.z;
+        
+        C[0][0] = p1.x; C[0][1] = p1.y; C[0][2] = 1;
+        C[1][0] = p2.x; C[1][1] = p2.y; C[1][2] = 1;
+        C[2][0] = p3.x; C[2][1] = p3.y; C[2][2] = 1;
+        
+        const double detD = D.det3x3();
+        const double detA = A.det3x3();
+        const double detB = B.det3x3();
+        const double detC = C.det3x3();
+        
+        Plane p;
+        if( detD != 0.0 )
+        {
+            face_planes[ i ].a = -1. * detA / detD;
+            face_planes[ i ].b = -1. * detB / detD;
+            face_planes[ i ].c = -1. * detC / detD;
+        }
+    }
+    
+    MItMeshVertex vertIter( mesh );
+    
+    int id = 0;
+    MMatrixArray vertexQ( pts.length() );
+    
+    for( ; !vertIter.isDone(); vertIter.next() )
+    {
+        MIntArray faceList;
+        vertIter.getConnectedFaces( faceList );
+        
+        MMatrix Q;
+        
+        Q[0][0] = 0.0; Q[0][1] = 0.0; Q[0][2] = 0.0; Q[0][3] = 0.0;
+        Q[1][0] = 0.0; Q[1][1] = 0.0; Q[1][2] = 0.0; Q[1][3] = 0.0;
+        Q[2][0] = 0.0; Q[2][1] = 0.0; Q[2][2] = 0.0; Q[2][3] = 0.0;
+        Q[3][0] = 0.0; Q[3][1] = 0.0; Q[3][2] = 0.0; Q[3][3] = 0.0;
+        
+        for( int f = 0; f < faceList.length(); f++ )
+        {
+            const Plane &p = face_planes[ faceList[ f ] ];
+            
+            const double aa = p.a * p.a, ab = p.a * p.b, ac = p.a * p.c, ad = p.a * p.d;
+            const double bb = p.b * p.b, bc = p.b * p.c, bd = p.b * p.d, cc = p.c * p.c;
+            const double cd = p.c * p.d, dd = p.d * p.d;
+            
+            Q[0][0] += aa; Q[0][1] += ab; Q[0][2] += ac; Q[0][3] += ad;
+            Q[1][0] += ab; Q[1][1] += bb; Q[1][2] += bc; Q[1][3] += bd;
+            Q[2][0] += ac; Q[2][1] += bc; Q[2][2] += cc; Q[2][3] += cd;
+            Q[3][0] += ad; Q[3][1] += bd; Q[3][2] += cd; Q[3][3] += dd;
+            
+        }
+        
+        vertexQ[ id++ ] = Q;
+    }
+    
+    MItMeshEdge edgeIter( mesh );
+    errors.resize( pts.length(), 0.0 );
+    for( ; !edgeIter.isDone(); edgeIter.next() )
+    {
+        const int v1 = edgeIter.index(0), v2 = edgeIter.index(1);
+        
+        MMatrix edgeQ = vertexQ[ v1 ] + vertexQ[ v2 ];
+        
+        if( edgeQ.det4x4() != 0 )
+        {
+            MMatrix tmp( edgeQ );
+            tmp[ 3 ][ 0 ] = 0.0;
+            tmp[ 3 ][ 1 ] = 0.0;
+            tmp[ 3 ][ 2 ] = 0.0;
+            tmp[ 3 ][ 3 ] = 1.0;
+
+            MMatrix invQ = tmp.inverse();
+
+            MPoint pt( 0, 0, 0, 1. );
+            MPoint result = invQ * pt;
+            MPoint left = result * edgeQ;
+
+            const double cost = left.x*result.x + left.y*result.y + left.z*result.z+ left.w*result.w;
+            errors[ v1 ] += cost;
+            errors[ v2 ] += cost;
+        }
+    }
+    
+    normalize( errors );
+}
 
 
 
